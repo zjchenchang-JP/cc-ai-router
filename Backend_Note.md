@@ -149,3 +149,73 @@ user_repository.go（查库）→ 一路 return → response.go（包装成统�
 ```
 
 跟着一条 `/user/login` 请求走一遍就通了——本质上和 Spring Boot 里走过的同款路径一样，只是换了语言表达。
+
+# 2026/10/18
+
+## 配置优先级链详解："环境变量 > .env 文件"是如何实现的（config.go）
+
+> 对应代码：`go-backend/internal/config/config.go` 的 `Load()` + `currentEnvKeys()` + `loadEnvFile()`
+> 完整优先级链：**命令行参数 > 真实环境变量 > .env 文件 > 代码默认值**（从高到低）
+
+### 一、问题背景：为什么需要"防覆盖"机制
+
+`loadEnvFile` 解析 `.env` 后会执行 `os.Setenv(key, value)` 把配置**写进进程环境变量**。
+如果无条件写入，会出事故——
+
+场景：部署到生产服务器时，运维不改镜像里的 `.env`，而是直接给进程设置真实环境变量：
+
+```bash
+REDIS_ADDR=redis-prod.internal:6379   # 运维设置的（Docker environment: / k8s env: / export）
+```
+
+而 `.env` 文件里还躺着开发值 `REDIS_ADDR=127.0.0.1:6379`。
+**没有保护的话**：`os.Setenv` 会把生产值强行改写成本地开发值 → 服务连错 Redis，事故。
+
+### 二、实现关键：baseEnv 快照 + 覆盖前检查
+
+```go
+// Load() 第一步：在任何 .env 加载之前，快照进程已存在的环境变量"键名"
+baseEnv := currentEnvKeys()   // 返回 map[string]struct{}，如 {"REDIS_ADDR", "PATH", ...}
+...
+loadEnvFiles(envName, baseEnv)  // 快照随后传进每个文件的解析过程
+```
+
+```go
+// loadEnvFile() 里，每读到一行 KEY=VALUE，写入前先检查：
+if _, exists := baseEnv[key]; exists {
+    continue   // 这个键在进程启动时就真实存在 → 跳过，绝不覆盖
+}
+_ = os.Setenv(key, value)
+```
+
+### 三、执行时间线（生产部署场景）
+
+| 步骤 | 发生什么 | REDIS_ADDR 状态 |
+|---|---|---|
+| 1. 进程启动前 | 运维设置了真实环境变量 | `redis-prod.internal:6379` ✅ |
+| 2. `Load()` 开头 | `currentEnvKeys()` 快照所有已存在变量名 | baseEnv 记下：`REDIS_ADDR` 存在 |
+| 3. 解析 `.env` | 读到 `REDIS_ADDR=127.0.0.1:6379`，准备 Setenv | 检查：在 baseEnv 里 → `continue` 跳过 |
+| 4. 后续 `os.Getenv("REDIS_ADDR")` | 读到的仍是 | `redis-prod.internal:6379` ✅ 生产值获胜 |
+
+本地开发场景（没设置过该环境变量）：baseEnv 里没有 `REDIS_ADDR` → 不跳过 → `.env` 的值正常注入。两种场景自动各得其所。
+
+### 四、隐藏细节：为什么 .env.dev 能覆盖 .env，真环境变量却不能？
+
+关键在于 **baseEnv 快照的时机**（在任何文件加载之前）：
+
+- **真实环境变量**：快照时已存在 → 在 baseEnv 里 → 所有 .env 文件都跳过，**永远不被覆盖**
+- **`.env` 注入的值**：快照时还不存在 → 不在 baseEnv 里 → 后加载的 `.env.dev` 检查发现"不在" → 允许 `os.Setenv` 覆盖
+
+即实现了源码注释那句话：*"Do not override real process-level env, but allow later .env files to override earlier .env files"*——**真变量神圣不可侵犯，文件之间后到的说了算**。
+
+### 五、一句话结论
+
+> **`.env` 只是"没有真实环境变量时的兜底"，真实环境变量永远说了算。**
+
+这正是 Spring Boot `PropertySource` 顺序（环境变量排在 application.yml 之前）的手写实现——Spring 里是框架魔法，Go 里是 `currentEnvKeys()` 快照 + 4 行 if 检查的显式代码。
+
+### 六、涉及的两个 Go 语法点
+
+1. **`if _, exists := baseEnv[key]; exists`** —— "comma ok" 惯用法：从 map 取值返回 `(value, ok)` 两个值；只关心键存不存在时用 `_` 丢弃值部分。Java 类比：`map.containsKey(key)`
+2. **`map[string]struct{}` 模拟 Set** —— Go 没有 Set 类型；`struct{}` 是零字节空类型，只借 map 的键、不占 value 空间，是标准的"集合"写法
+
