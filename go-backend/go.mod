@@ -1,4 +1,4 @@
-module github.com/zjchenchang-JP/cc-ai-router
+module github.com/zjchenchang-JP/cc-ai-router/go-backend
 
 go 1.26.0
 
